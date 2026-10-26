@@ -1,0 +1,198 @@
+name: Build & Release cloudflared (mipsle)
+
+on:
+  schedule:
+    # Run daily at 03:00 UTC to check for new upstream releases
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream cloudflared version/tag to build (e.g. 2026.9.3, or "latest")'
+        required: false
+        default: 'latest'
+      force_build:
+        description: 'Force build even if release already exists'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Determine upstream version
+        id: version_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT_VERSION="${{ inputs.version }}"
+          FORCE="${{ inputs.force_build }}"
+
+          if [ -n "$INPUT_VERSION" ] && [ "$INPUT_VERSION" != "latest" ]; then
+            TARGET_VERSION="$INPUT_VERSION"
+          else
+            echo "Fetching latest release tag from cloudflare/cloudflared..."
+            TARGET_VERSION=$(gh api repos/cloudflare/cloudflared/releases/latest --jq .tag_name)
+          fi
+
+          if [ -z "$TARGET_VERSION" ] || [ "$TARGET_VERSION" = "null" ]; then
+            echo "::error::Could not determine upstream cloudflared version!"
+            exit 1
+          fi
+
+          echo "Target version: $TARGET_VERSION"
+          echo "version=$TARGET_VERSION" >> "$GITHUB_OUTPUT"
+
+          # Check if this release already exists in current repository
+          if [ "$FORCE" != "true" ]; then
+            if gh release view "$TARGET_VERSION" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "Release $TARGET_VERSION already exists in ${{ github.repository }}. Skipping build."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        if: steps.version_check.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone upstream cloudflared
+        if: steps.version_check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.version_check.outputs.version }}"
+          echo "Cloning cloudflare/cloudflared tag $VERSION..."
+          git clone --depth 1 --branch "$VERSION" https://github.com/cloudflare/cloudflared upstream-src
+
+      - name: Set up Go
+        if: steps.version_check.outputs.skip != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'upstream-src/go.mod'
+          cache: true
+          cache-dependency-path: 'upstream-src/go.sum'
+
+      - name: Build cloudflared for mipsle (softfloat)
+        if: steps.version_check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.version_check.outputs.version }}"
+          BUILD_TIME=$(date -u '+%Y-%m-%d-%H:%M UTC')
+          GO_VER=$(go version)
+          echo "Go version: $GO_VER"
+          echo "Building cloudflared $VERSION for linux/mipsle (GOMIPS=softfloat)..."
+
+          cd upstream-src
+          CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat \
+            go build -v -trimpath \
+            -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.BuildTime=${BUILD_TIME}'" \
+            -o ../cloudflared-linux-mipsle \
+            ./cmd/cloudflared
+
+          cd ..
+          chmod +x cloudflared-linux-mipsle
+          sha256sum cloudflared-linux-mipsle > cloudflared-linux-mipsle.sha256
+
+          echo "Build successful! File details:"
+          ls -lh cloudflared-linux-mipsle
+          cat cloudflared-linux-mipsle.sha256
+
+      - name: Upload build artifact
+        if: steps.version_check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflared-linux-mipsle
+          path: |
+            cloudflared-linux-mipsle
+            cloudflared-linux-mipsle.sha256
+          retention-days: 14
+
+      - name: Update root binary and README
+        if: steps.version_check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.version_check.outputs.version }}"
+          GO_VER=$(go env GOVERSION | sed 's/^go//')
+
+          # Replace root binary with the newly built binary
+          cp cloudflared-linux-mipsle cloudflared
+          chmod +x cloudflared
+
+          # Update README version & Go version
+          sed -i -E "s/Current version \`[^\`]+\`/Current version \`$VERSION\`/" README.md
+          sed -i -E "s/Builded with Go \`[^\`]+\`/Builded with Go \`$GO_VER\`/" README.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add cloudflared README.md
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "bump cloudflared to $VERSION"
+            git pull --rebase origin main || true
+            git push origin main
+          fi
+
+      - name: Create or update GitHub Release
+        if: steps.version_check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version_check.outputs.version }}"
+          SHA=$(awk '{print $1}' cloudflared-linux-mipsle.sha256)
+          RELEASE_TITLE="cloudflared $VERSION (mipsle softfloat)"
+
+          cat << 'EOF' > release_notes.md
+          ## cloudflared VERSION_PLACEHOLDER for mipsle
+
+          Automated build of official Cloudflare Tunnel client [cloudflare/cloudflared@VERSION_PLACEHOLDER](https://github.com/cloudflare/cloudflared/releases/tag/VERSION_PLACEHOLDER) for **MIPS little-endian (mipsle)** with software floating point (**softfloat**).
+
+          ### Compatible Devices
+          - **Keenetic Viva** (KN-1910)
+          - **Keenetic Giga** (KN-1010)
+          - **Keenetic Ultra** (KN-1810)
+          - Other MediaTek MT7621 / MT7628 / MIPS32 little-endian routers running Keenetic OS (Entware) or OpenWrt.
+
+          ### Quick Install (Entware / Keenetic)
+          ```sh
+          wget -O /opt/home/cloudflared https://github.com/REPO_PLACEHOLDER/raw/main/cloudflared
+          chmod +x /opt/home/cloudflared
+          ```
+          Or download directly from this release:
+          ```sh
+          wget -O /opt/home/cloudflared https://github.com/REPO_PLACEHOLDER/releases/download/VERSION_PLACEHOLDER/cloudflared-linux-mipsle
+          chmod +x /opt/home/cloudflared
+          ```
+
+          ### SHA256 Checksum
+          - `cloudflared-linux-mipsle`: `SHA_PLACEHOLDER`
+          EOF
+
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" release_notes.md
+          sed -i "s|REPO_PLACEHOLDER|${{ github.repository }}|g" release_notes.md
+          sed -i "s/SHA_PLACEHOLDER/$SHA/g" release_notes.md
+
+          if gh release view "$VERSION" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Updating existing release $VERSION..."
+            gh release upload "$VERSION" cloudflared-linux-mipsle cloudflared-linux-mipsle.sha256 --repo "${{ github.repository }}" --clobber
+            gh release edit "$VERSION" --title "$RELEASE_TITLE" --notes-file release_notes.md --repo "${{ github.repository }}"
+          else
+            echo "Creating new release $VERSION..."
+            gh release create "$VERSION" \
+              cloudflared-linux-mipsle \
+              cloudflared-linux-mipsle.sha256 \
+              --repo "${{ github.repository }}" \
+              --target main \
+              --title "$RELEASE_TITLE" \
+              --notes-file release_notes.md
+          fi
