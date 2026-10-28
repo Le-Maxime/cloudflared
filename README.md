@@ -4,7 +4,7 @@
 
 Tested on Keenetic Viva (KN-1910)
 
-Current version `2026.10.4`
+Current version `2026.10.5`
 
 Builded with Go `1.27.3`
 
