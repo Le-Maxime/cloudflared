@@ -4,9 +4,9 @@
 
 Tested on Keenetic Viva (KN-1910)
 
-Current version `2026.10.7`
+Current version `2026.11.0`
 
-Builded with Go `1.27.3`
+Builded with Go `1.27.4`
 
 WARNING: All software provided here is provided as is without any questions or complaints. Please direct all questions and complaints to the original cloudflared repository, this is just an assembly for mipsle devices assembled from the source code without any changes. All open issues related to the work of cloudflared itself will be closed without response. You have been warned.
 
